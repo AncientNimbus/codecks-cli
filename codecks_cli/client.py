@@ -601,10 +601,12 @@ class CodecksClient:
                     stale.append(row)
                     is_stale = True
 
-            # Aggregate by deck and owner
-            deck = row.get("deck_name") or "unknown"
-            owner = row.get("owner_name") or "unassigned"
-            for key, agg in ((deck, deck_agg), (owner, owner_agg)):
+            # Aggregate by deck and owner. NOTE: use distinct local names —
+            # rebinding `owner` here would clobber the filter echoed in
+            # result["filters"]["owner"].
+            card_deck = row.get("deck_name") or "unknown"
+            card_owner = row.get("owner_name") or "unassigned"
+            for key, agg in ((card_deck, deck_agg), (card_owner, owner_agg)):
                 if key not in agg:
                     agg[key] = {"total": 0, "blocked": 0, "stale": 0, "in_progress": 0}
                 agg[key]["total"] += 1
@@ -891,16 +893,25 @@ class CodecksClient:
             result_dict["attachments"] = attachment_result
         return result_dict
 
-    def attach_files(self, card_id: str, files: list[str]) -> dict[str, Any]:
+    def attach_files(self, card_id: str, files: list[str], dry_run: bool = False) -> dict[str, Any]:
         """Attach local files to an existing card.
+
+        Paths must resolve inside an allowed root (the project root and the
+        current working directory, plus any directory listed in
+        ``CODECKS_ATTACH_ALLOW_DIRS``) and must not match the
+        credential denylist.
 
         Args:
             card_id: Card UUID.
             files: Local file paths to upload and attach.
+            dry_run: Validate and describe the files (resolved path, size,
+                sha256) without uploading anything.
 
         Returns:
             dict with ok, card_id, attached, failed, and files.
         """
+        if dry_run:
+            return attach_files_to_card(card_id, files, user_id="", dry_run=True)  # type: ignore[return-value]
         return attach_files_to_card(card_id, files, user_id=_get_user_id())  # type: ignore[return-value]
 
     def update_cards(
@@ -925,7 +936,8 @@ class CodecksClient:
 
         Args:
             card_ids: List of card UUIDs.
-            status: New status (not_started, started, done, blocked, in_review).
+            status: New status (not_started, started, done, blocked, in_review,
+                or 'null' to clear).
             priority: New priority (a, b, c, or 'null' to clear).
             effort: New effort (int, or 'null' to clear).
             deck: Move to this deck (by name).
@@ -945,7 +957,7 @@ class CodecksClient:
         update_kwargs: dict[str, Any] = {}
 
         if status is not None:
-            update_kwargs["status"] = status
+            update_kwargs["status"] = None if status == "null" else status
 
         if priority is not None:
             update_kwargs["priority"] = None if priority == "null" else priority
@@ -1356,7 +1368,8 @@ class CodecksClient:
 
         Args:
             name: Tag name.
-            color: Optional hex color.
+            color: Accepted for backward compatibility and ignored — the
+                `projects/addTag` endpoint has no color field.
 
         Returns:
             dict with ok, tag_name, source.
@@ -1376,10 +1389,13 @@ class CodecksClient:
         return result
 
     def archive_deck_admin(self, deck: str) -> dict[str, Any]:
-        """Archive a deck (reversible, via dispatch API).
+        """Delete a deck via the dispatch API. NOT reversible.
+
+        The dispatch API has no deck-archive action, so this dispatches
+        `decks/delete`. The deck cannot be restored; its cards are preserved.
 
         Args:
-            deck: Deck name to archive.
+            deck: Deck name to delete.
 
         Returns:
             dict with ok, deck_name, source.

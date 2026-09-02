@@ -108,7 +108,7 @@ codecks_cli/
     _dashboards.py       format_pm_focus_table, format_standup_table
     _gdd.py              format_gdd_table, format_sync_report
   mcp_server/           <- 53 MCP tools (package, 6 tool modules)
-    __init__.py          FastMCP init, registration, re-exports
+    __init__.py          MCPServer init, registration, re-exports
     __main__.py          py -m codecks_cli.mcp_server entry
     _core.py             Client cache, dispatcher, snapshot cache
     _security.py         Injection detection, sanitization
@@ -121,7 +121,7 @@ codecks_cli/
     _tools_admin.py      5 admin tools (dispatch API)
   pm_playbook.md        <- Agent-agnostic PM methodology
   py.typed              <- PEP 561 type marker
-tests/                  <- 1000+ pytest tests across 23 files (no live API calls)
+tests/                  <- 1000+ pytest tests across 24 files (no live API calls)
 docker/                 <- Wrapper scripts (build, test, quality, cli, mcp, shell, dev, logs)
 ```
 
@@ -188,6 +188,7 @@ py -m pytest --tb=short                # shorter tracebacks
 | `test_repository.py` | CardRepository (indexed card access) |
 | `test_store.py` | CardStore (SQLite storage layer) |
 | `test_exceptions.py` | Exception hierarchy |
+| `test_admin.py` | Admin dispatch ops (deck creation, cache seeding) |
 
 ### Writing Tests
 
@@ -216,8 +217,24 @@ Run everything in a sandboxed Linux container — no Python install needed on th
 - Source is volume-mounted — edits reflect instantly, no rebuild needed
 - `.env` is mounted at runtime via `env_file:`, never baked into the image
 - Default builds use the lightweight Python runtime; shell/Claude scripts build the optional agent image on demand
-- `PYTHON_VERSION=3.14 ./docker/build.sh` to build with a different Python version
 - `MCP_HTTP_PORT=9000 ./docker/mcp-http.sh` to override the HTTP port
+
+#### MCP HTTP transport
+
+The HTTP MCP server (`scripts/run_mcp_http.py`) is unauthenticated, so it binds
+loopback by default and the Compose service publishes its port on `127.0.0.1`
+only:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `MCP_HTTP_HOST` | `127.0.0.1` | Bind address. Compose sets `0.0.0.0` *inside* the container; only use a non-loopback value behind a loopback-published port or a trusted reverse proxy. |
+| `MCP_HTTP_PORT` | `8808` | TCP port. |
+| `MCP_HTTP_ALLOWED_HOSTS` | `localhost:*,127.0.0.1:*,[::1]:*` | Comma-separated `Host` header allowlist, applied when `MCP_HTTP_HOST` is not loopback. |
+| `MCP_HTTP_ALLOWED_ORIGINS` | `http://localhost:*,http://127.0.0.1:*,http://[::1]:*` | Comma-separated `Origin` header allowlist, same condition. |
+
+The MCP SDK only auto-enables DNS-rebinding protection for loopback binds, so
+`build_transport_security()` supplies explicit `TransportSecuritySettings` for
+every other bind address.
 
 ### Security Hardening
 

@@ -525,6 +525,14 @@ class TestUpdateCards:
         assert result["fields"]["priority"] is None
 
     @patch("codecks_cli.client.update_card")
+    def test_clears_status_with_null(self, mock_update):
+        mock_update.return_value = {}
+        client = _client()
+        result = client.update_cards(["c1"], status="null")
+        assert result["fields"]["status"] is None
+        assert mock_update.call_args.kwargs["status"] is None
+
+    @patch("codecks_cli.client.update_card")
     def test_clears_effort_with_null(self, mock_update):
         mock_update.return_value = {}
         client = _client()
@@ -899,6 +907,44 @@ class TestPMFocus:
         # Owner aggregation
         assert health["by_owner"]["Thomas"]["total"] == 2
         assert health["by_owner"]["unassigned"]["total"] == 1
+
+    @patch("codecks_cli.client.extract_hand_card_ids")
+    @patch("codecks_cli.client.list_hand")
+    @patch("codecks_cli.client.enrich_cards", side_effect=lambda c, u: c)
+    @patch("codecks_cli.client.list_cards")
+    def test_filters_echo_the_owner_argument(self, mock_list, mock_enrich, mock_hand, mock_extract):
+        """The per-card owner aggregation must not clobber the owner filter."""
+        mock_list.return_value = {
+            "card": {
+                "c1": {"title": "A", "status": "started", "owner_name": "Thomas"},
+                "c2": {"title": "B", "status": "started", "owner_name": "Caroline"},
+            },
+            "user": {},
+        }
+        mock_hand.return_value = {}
+        mock_extract.return_value = set()
+        client = _client()
+        result = client.pm_focus(owner="Thomas", project="Tea Shop")
+        assert result["filters"]["owner"] == "Thomas"
+        assert result["filters"]["project"] == "Tea Shop"
+        assert mock_list.call_args.kwargs["owner_filter"] == "Thomas"
+
+    @patch("codecks_cli.client.extract_hand_card_ids")
+    @patch("codecks_cli.client.list_hand")
+    @patch("codecks_cli.client.enrich_cards", side_effect=lambda c, u: c)
+    @patch("codecks_cli.client.list_cards")
+    def test_filters_owner_none_when_unfiltered(
+        self, mock_list, mock_enrich, mock_hand, mock_extract
+    ):
+        mock_list.return_value = {
+            "card": {"c1": {"title": "A", "status": "started", "owner_name": "Thomas"}},
+            "user": {},
+        }
+        mock_hand.return_value = {}
+        mock_extract.return_value = set()
+        client = _client()
+        result = client.pm_focus()
+        assert result["filters"]["owner"] is None
 
 
 # ---------------------------------------------------------------------------

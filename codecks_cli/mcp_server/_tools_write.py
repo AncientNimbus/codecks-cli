@@ -4,6 +4,7 @@ import builtins
 from typing import Literal
 
 from codecks_cli import CliError
+from codecks_cli._utils import card_is_doc as _card_is_doc
 from codecks_cli.mcp_server import _core
 from codecks_cli.mcp_server._core import (
     _call,
@@ -82,27 +83,47 @@ def create_card(
 def attach_files(card_id: str, files: list[str], dry_run: bool = False) -> dict:
     """Attach local file(s) to an existing card.
 
+    Paths must resolve inside an allowed root — the project root and the
+    current working directory, plus any directory listed in the
+    CODECKS_ATTACH_ALLOW_DIRS environment variable (os.pathsep-separated).
+    Dot-prefixed components and credential-looking names (*.pem, *.key,
+    id_rsa*, *token*, *secret*, ...) are always refused. dry_run validates
+    locally and needs neither a token nor a network call.
+
     Args:
         card_id: Full 36-char UUID.
         files: Local file paths visible to the MCP server process.
-        dry_run: If True, validate the card ID and preview without uploading.
+        dry_run: If True, validate the paths and report resolved path, size and
+            sha256 for each file without uploading anything.
 
     Returns:
-        Dict with ok, card_id, attached, failed, and files.
+        Dict with ok, card_id, attached, failed, and files. On dry_run, files
+        carries {path, resolved, size, sha256} entries and dry_run is True.
     """
     try:
         _validate_uuid(card_id)
     except CliError as e:
         return _finalize_tool_result(_contract_error(str(e), "error"))
     if dry_run:
+        # A preview uploads nothing, so it must not need a token or a network
+        # round-trip: run the path policy locally instead of going through
+        # _call() -> _get_client() (which validates the session token).
+        from codecks_cli.attachments import preview_attachment_files
+
+        try:
+            previews = preview_attachment_files(files)
+        except CliError as e:
+            return _finalize_tool_result(_contract_error(str(e), "error"))
         return _finalize_tool_result(
             {
                 "ok": True,
                 "dry_run": True,
-                "action": "attach_files",
                 "card_id": card_id,
-                "file_count": len(files),
-                "files": files,
+                "attached": 0,
+                "failed": 0,
+                "files": previews,
+                "action": "attach_files",
+                "file_count": len(previews),
                 "message": f"Would attach {len(files)} file(s) to card {card_id}",
             }
         )
@@ -171,7 +192,7 @@ def update_cards(
             for cid in card_ids:
                 for card in cached_cards.get("cards", []):
                     if isinstance(card, dict) and card.get("id") == cid:
-                        if card.get("cardType") == "doc" or card.get("is_doc"):
+                        if _card_is_doc(card):
                             return _finalize_tool_result(
                                 _contract_error(
                                     f"Card '{cid}' is a doc card. Doc cards do not support: "
@@ -820,7 +841,9 @@ def batch_create_cards(
     _existing_titles: dict[str, str] = {}  # normalized_title → card_id
     _cache_has_data = False
     repo = _core.get_repository()
-    if repo and repo.all_cards:
+    # ``all_cards`` copies the list under the repo lock on every access, so ask
+    # for the cheap count first and bind the snapshot once.
+    if repo and repo.count:
         _cache_has_data = True
         for c in repo.all_cards:
             t = (c.get("title") or "").strip().lower()
@@ -828,7 +851,7 @@ def batch_create_cards(
                 _existing_titles[t] = c.get("id", "")
 
     # Suppress per-card disk writes; persist once after the batch
-    _core._batch_in_progress = True
+    _core._set_batch_in_progress(True)
     try:
         for i, item in enumerate(parsed):
             if not isinstance(item, dict):
@@ -920,7 +943,7 @@ def batch_create_cards(
             # Track this title so later items in the same batch don't duplicate it
             _existing_titles[normalized] = card_id
     finally:
-        _core._batch_in_progress = False
+        _core._set_batch_in_progress(False)
         _core._persist_cache_to_disk()  # Single disk write for the whole batch
 
     response: dict = {
@@ -945,7 +968,7 @@ def _batch_single_card_op(
     """
     results: list[dict] = []
     success = 0
-    _core._batch_in_progress = True
+    _core._set_batch_in_progress(True)
     try:
         for card_id in card_ids:
             op_result = _call(method_name, card_id=card_id)
@@ -958,9 +981,18 @@ def _batch_single_card_op(
                 )
                 results.append({"card_id": card_id, "status": "error", "error": error_msg})
     finally:
-        _core._batch_in_progress = False
+        _core._set_batch_in_progress(False)
         _core._persist_cache_to_disk()
     return success, results
+
+
+def _batch_failures(results: list[dict]) -> list[dict]:
+    """Extract the per-card failures from a batch result list."""
+    return [
+        {"card_id": r.get("card_id"), "error": r.get("error", "")}
+        for r in results
+        if r.get("status") == "error"
+    ]
 
 
 def _validate_batch_ids(card_ids: list[str]) -> list[str] | dict:
@@ -983,14 +1015,22 @@ def batch_delete_cards(card_ids: list[str]) -> dict:
         card_ids: List of 36-char card UUIDs to delete. Max 20.
 
     Returns:
-        Dict with deleted count and per-card results.
+        Dict with ok (False if any card failed), deleted count,
+        per-card results, and a failed list of {card_id, error}.
     """
     ids = _validate_batch_ids(card_ids)
     if isinstance(ids, dict):
         return ids
     deleted, results = _batch_single_card_op(ids, "delete_card", "deleted", "Delete failed.")
+    failed = _batch_failures(results)
     return _finalize_tool_result(
-        {"ok": True, "deleted": deleted, "total": len(ids), "results": results}
+        {
+            "ok": not failed,
+            "deleted": deleted,
+            "total": len(ids),
+            "results": results,
+            "failed": failed,
+        }
     )
 
 
@@ -1002,14 +1042,22 @@ def batch_archive_cards(card_ids: list[str]) -> dict:
         card_ids: List of 36-char card UUIDs to archive. Max 20.
 
     Returns:
-        Dict with archived count and per-card results.
+        Dict with ok (False if any card failed), archived count,
+        per-card results, and a failed list of {card_id, error}.
     """
     ids = _validate_batch_ids(card_ids)
     if isinstance(ids, dict):
         return ids
     archived, results = _batch_single_card_op(ids, "archive_card", "archived", "Archive failed.")
+    failed = _batch_failures(results)
     return _finalize_tool_result(
-        {"ok": True, "archived": archived, "total": len(ids), "results": results}
+        {
+            "ok": not failed,
+            "archived": archived,
+            "total": len(ids),
+            "results": results,
+            "failed": failed,
+        }
     )
 
 
@@ -1020,7 +1068,8 @@ def batch_unarchive_cards(card_ids: list[str]) -> dict:
         card_ids: List of 36-char card UUIDs to unarchive. Max 20.
 
     Returns:
-        Dict with unarchived count and per-card results.
+        Dict with ok (False if any card failed), unarchived count,
+        per-card results, and a failed list of {card_id, error}.
     """
     ids = _validate_batch_ids(card_ids)
     if isinstance(ids, dict):
@@ -1029,12 +1078,14 @@ def batch_unarchive_cards(card_ids: list[str]) -> dict:
         ids, "unarchive_card", "unarchived", "Unarchive failed."
     )
 
+    failed = _batch_failures(results)
     return _finalize_tool_result(
         {
-            "ok": True,
+            "ok": not failed,
             "unarchived": unarchived,
             "total": len(ids),
             "results": results,
+            "failed": failed,
         }
     )
 
@@ -1198,7 +1249,7 @@ def undo() -> dict:
 
 
 def register(mcp):
-    """Register all write tools with the FastMCP instance."""
+    """Register all write tools with the MCPServer instance."""
     mcp.tool()(create_card)
     mcp.tool()(attach_files)
     mcp.tool()(update_cards)

@@ -1,7 +1,7 @@
 """Shared operations used by both CLI commands and MCP tools.
 
 These functions contain business logic that is independent of the
-transport layer (CLI argparse vs MCP FastMCP). Both cli.py commands
+transport layer (CLI argparse vs MCP MCPServer). Both cli.py commands
 and mcp_server/_tools_*.py tools should call these instead of
 duplicating logic.
 """
@@ -10,8 +10,16 @@ import json
 import os
 import re
 import tempfile
+import threading
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
+from codecks_cli._utils import (
+    card_deck_name,
+    card_matches_project,
+    card_owner_name,
+    card_updated_at,
+)
 from codecks_cli.client import CodecksClient
 from codecks_cli.config import _PROJECT_ROOT
 
@@ -147,6 +155,45 @@ def tick_all_checkboxes(client: CodecksClient, card_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Project resolution
+# ---------------------------------------------------------------------------
+
+
+def _deck_project_map(client: CodecksClient) -> dict[str, str]:
+    """Deck id / deck name -> project name, for resolving a card's project.
+
+    Flattened cards carry no ``project`` key, so project filters resolve a
+    card's deck instead. Returns an empty map if decks cannot be fetched.
+    """
+    from codecks_cli._utils import build_deck_project_map
+
+    try:
+        return build_deck_project_map(client.list_decks(include_card_counts=False))
+    except Exception:
+        return {}
+
+
+def _filter_by_project(client: CodecksClient, cards: list[dict], project: str | None) -> list[dict]:
+    """Keep only cards belonging to *project* (deck-resolved when needed)."""
+    if not project:
+        return cards
+    deck_projects: dict[str, str] | None = None
+    kept = []
+    for card in cards:
+        if not isinstance(card, dict):
+            continue
+        if card.get("project") or card.get("project_name"):
+            if card_matches_project(card, project):
+                kept.append(card)
+            continue
+        if deck_projects is None:
+            deck_projects = _deck_project_map(client)
+        if card_matches_project(card, project, deck_projects):
+            kept.append(card)
+    return kept
+
+
+# ---------------------------------------------------------------------------
 # Overview / aggregation
 # ---------------------------------------------------------------------------
 
@@ -164,9 +211,7 @@ def quick_overview(client: CodecksClient, *, project: str | None = None) -> dict
     result = client.list_cards()
     cards = result.get("cards", []) if isinstance(result, dict) else []
 
-    if project:
-        project_lower = project.lower()
-        cards = [c for c in cards if str(c.get("project", "")).lower() == project_lower]
+    cards = _filter_by_project(client, cards, project)
 
     by_status: dict[str, int] = {}
     by_priority: dict[str, int] = {}
@@ -187,7 +232,7 @@ def quick_overview(client: CodecksClient, *, project: str | None = None) -> dict
         p = card.get("priority") or "null"
         by_priority[p] = by_priority.get(p, 0) + 1
 
-        d = card.get("deck", "") or card.get("deck_name", "") or "unassigned"
+        d = card_deck_name(card) or "unassigned"
         deck_counts[d] = deck_counts.get(d, 0) + 1
 
         effort = card.get("effort")
@@ -195,7 +240,7 @@ def quick_overview(client: CodecksClient, *, project: str | None = None) -> dict
             total_effort += effort
             estimated_count += 1
 
-        updated = card.get("updated_at") or card.get("updatedAt") or ""
+        updated = card_updated_at(card)
         if updated and updated < cutoff_str and s in ("started", "not_started", "blocked"):
             stale_count += 1
 
@@ -250,9 +295,7 @@ def partition_cards(
         for c in cards
         if isinstance(c, dict) and c.get("status") in statuses and not c.get("is_archived")
     ]
-    if project:
-        project_lower = project.lower()
-        cards = [c for c in cards if str(c.get("project", "")).lower() == project_lower]
+    cards = _filter_by_project(client, cards, project)
 
     # Partition
     buckets: dict[str, list[str]] = {}
@@ -271,7 +314,7 @@ def partition_cards(
                 buckets.setdefault("other", []).append(card.get("id", ""))
     elif by == "owner":
         for card in cards:
-            owner = card.get("owner_name") or card.get("owner") or "unassigned"
+            owner = card_owner_name(card) or "unassigned"
             buckets.setdefault(owner, []).append(card.get("id", ""))
     else:
         return {
@@ -495,6 +538,11 @@ def save_feedback(
 _UNDO_FILE = ".pm_undo.json"
 _UNDO_PATH = os.path.join(_PROJECT_ROOT, _UNDO_FILE)
 
+#: Serializes read-modify-write of the undo snapshot file. MCP SDK v2 runs sync
+#: tool functions on a worker-thread pool, so two mutations can land here at
+#: once. Only the file access is guarded — never an API request.
+_undo_lock = threading.Lock()
+
 
 def snapshot_before_mutation(client: CodecksClient, card_ids: list[str]) -> None:
     """Save current state of cards about to be mutated for undo support.
@@ -520,14 +568,29 @@ def snapshot_before_mutation(client: CodecksClient, card_ids: list[str]) -> None
         "timestamp": datetime.now(UTC).isoformat(),
         "cards": cards,
     }
-    try:
-        undo_dir = os.path.dirname(_UNDO_PATH) or "."
-        fd, tmp = tempfile.mkstemp(dir=undo_dir, suffix=".tmp")
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        os.replace(tmp, _UNDO_PATH)
-    except OSError:
-        pass  # Non-fatal
+    with _undo_lock:
+        try:
+            undo_dir = os.path.dirname(_UNDO_PATH) or "."
+            fd, tmp = tempfile.mkstemp(dir=undo_dir, suffix=".tmp")
+            try:
+                try:
+                    handle = os.fdopen(fd, "w", encoding="utf-8")
+                except BaseException:
+                    # fdopen did not take ownership of the descriptor — close it
+                    # here or it leaks for the lifetime of the process.
+                    os.close(fd)
+                    raise
+                with handle as f:
+                    json.dump(data, f, indent=2)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+            os.replace(tmp, _UNDO_PATH)
+        except OSError:
+            pass  # Non-fatal
 
 
 def undo_last_mutation(client: CodecksClient) -> dict:
@@ -536,14 +599,23 @@ def undo_last_mutation(client: CodecksClient) -> dict:
     Returns:
         dict with ok, reverted_count, details.
     """
-    try:
-        with open(_UNDO_PATH, encoding="utf-8") as f:
-            data = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return {
-            "ok": False,
-            "error": "No undo snapshot found. Mutations save snapshots automatically.",
-        }
+    # Read *and* consume the snapshot in one critical section. Releasing the
+    # lock in between would let a concurrent mutation write a newer snapshot
+    # that the unlink below then destroys — only the snapshot actually read
+    # here may ever be removed.
+    with _undo_lock:
+        try:
+            with open(_UNDO_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return {
+                "ok": False,
+                "error": "No undo snapshot found. Mutations save snapshots automatically.",
+            }
+        try:
+            os.unlink(_UNDO_PATH)
+        except OSError:
+            pass
 
     cards = data.get("cards", {})
     if not cards:
@@ -553,24 +625,20 @@ def undo_last_mutation(client: CodecksClient) -> dict:
     errors = []
     for cid, prev_state in cards.items():
         try:
-            updates = {}
-            if prev_state.get("status"):
-                updates["status"] = prev_state["status"]
-            if prev_state.get("priority"):
-                updates["priority"] = prev_state["priority"]
-            if prev_state.get("effort") is not None:
-                updates["effort"] = prev_state["effort"]
+            updates: dict[str, Any] = {}
+            for field in ("status", "priority", "effort"):
+                if field not in prev_state:
+                    continue
+                value = prev_state[field]
+                # A snapshotted None means "the field was empty". Passing None to
+                # update_cards() means "leave unchanged", so use the "null"
+                # sentinel it understands for clearing a field instead.
+                updates[field] = "null" if value is None else value
             if updates:
                 client.update_cards([cid], **updates)
                 reverted.append(cid)
         except Exception as e:
             errors.append({"card_id": cid, "error": str(e)})
-
-    # Remove undo file after use
-    try:
-        os.unlink(_UNDO_PATH)
-    except OSError:
-        pass
 
     return {
         "ok": True,
