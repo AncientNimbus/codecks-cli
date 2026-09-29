@@ -366,7 +366,8 @@ def session_request(path="/", data=None, method="POST", idempotent=False):
     Used for reading data and dispatch mutations."""
     url = config.BASE_URL + path
     headers = {
-        "X-Auth-Token": config.SESSION_TOKEN,
+        "Cookie": f"at={config.SESSION_TOKEN}",
+        "Origin": f"https://{config.ACCOUNT}.codecks.io",
         "X-Account": config.ACCOUNT,
         "Content-Type": "application/json",
         "Accept": "application/json",
